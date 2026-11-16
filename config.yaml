@@ -6,13 +6,17 @@ depth:
 
   # Input image directory and output directory for depth maps
   image_dir: /content/Geo/data/kitti/training/image_2
-  output_dir: /content/Geo/depth_maps/v3_504
+  output_dir: /content/Geo/data/depth_maps/v3_504
 
   # KITTI calibration directory; required only for V3
   calib_dir: /content/Geo/data/kitti/training/calib
 
   # auto: automatically use the GPU if available
   device: auto
+
+  # Number of independent images per GPU forward pass.
+  # Start with 2 on T4. If GPU memory runs out, use 1.
+  batch_size: 2
 
   # This section is used only when version: v2
   v2:

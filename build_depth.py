@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -25,6 +26,7 @@ def arguments():
     p.add_argument('--calib-dir', help='Directory containing matching KITTI calibration files (V3)')
     p.add_argument('--output-dir', help='Directory for NPZ files; use separate directories per run')
     p.add_argument('--input-size', type=int, help='V2: short side; V3: long side, in pixels')
+    p.add_argument('--batch-size', type=int, help='Independent images per model forward pass')
     p.add_argument('--v2-model', choices=['small', 'base', 'large'])
     p.add_argument('--v2-repo', help='Root of official Depth-Anything-V2 git repository')
     p.add_argument('--v2-weights-dir', help='Directory with official V2 metric VKITTI weights')
@@ -66,6 +68,9 @@ def read_config(args):
     size = args.input_size if args.input_size is not None else (v2.get('input_size', 518) if version == 'v2' else v3.get('input_size', 504))
     if isinstance(size, bool) or not isinstance(size, int) or size < 14:
         raise ValueError('input_size must be an integer >= 14.')
+    batch_size = args.batch_size if args.batch_size is not None else d.get('batch_size', 2)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError('batch_size must be an integer >= 1.')
     if args.limit is not None and args.limit < 1:
         raise ValueError('--limit must be >= 1')
     model = args.v2_model or v2.get('model', 'small')
@@ -76,7 +81,7 @@ def read_config(args):
         raise ValueError('device must be auto, cuda, or cpu')
     return dict(version=version, image_dir=args.image_dir or d.get('image_dir'),
                 calib_dir=args.calib_dir or d.get('calib_dir'), output_dir=out,
-                input_size=size, device=device, v2_model=model,
+                input_size=size, batch_size=batch_size, device=device, v2_model=model,
                 v2_repo=args.v2_repo or v2.get('repo_dir', '/content/Depth-Anything-V2'),
                 v2_weights_dir=args.v2_weights_dir or v2.get('weights_dir', '/content/depth_models/v2'), v3_model_dir=model_dir)
 
@@ -194,51 +199,121 @@ def load_model(cfg):
     return model.to(dev).eval(), dev
 
 
-def predict_v2(model, dev, bgr, size):
+def make_v2_transforms(size):
     import cv2
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
     from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
-    # Same transform and interpolation as the official metric infer_image(),
-    # but put the tensor on the explicitly selected device.
-    h, w = bgr.shape[:2]
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) / 255.0
-    sample = {'image': rgb}
-    for transform in (Resize(width=size, height=size, resize_target=False, keep_aspect_ratio=True,
-                             ensure_multiple_of=14, resize_method='lower_bound', image_interpolation_method=cv2.INTER_CUBIC),
-                      NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), PrepareForNet()):
-        sample = transform(sample)
-    tensor = torch.from_numpy(sample['image']).unsqueeze(0).to(dev)
-    ph, pw = tensor.shape[-2:]
-    with torch.inference_mode():
-        pred = model(tensor)
-        pred = F.interpolate(pred[:, None], (h, w), mode='bilinear', align_corners=True)[0, 0]
-    return pred.float().cpu().numpy(), {'model_input_hw': [ph, pw], 'max_depth_m': 80.0}
+    return (
+        Resize(width=size, height=size, resize_target=False, keep_aspect_ratio=True,
+               ensure_multiple_of=14, resize_method='lower_bound', image_interpolation_method=cv2.INTER_CUBIC),
+        NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        PrepareForNet(),
+    )
 
 
-def predict_v3(model, bgr, p2, size):
+def prepare_one(image_path, cfg, model, v2_transforms):
+    """Preprocess one image independently; never crop to match other images."""
     import cv2
     import numpy as np
     import torch
-    import torch.nn.functional as F
+    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError(f'Could not read image: {image_path}')
     h, w = bgr.shape[:2]
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    # DA3's metric branch returns canonical depth: apply known focal correction once.
-    pred = model.inference([rgb], process_res=size, process_res_method='upper_bound_resize')
-    raw = np.asarray(pred.depth[0], dtype=np.float32)
-    if raw.ndim != 2 or min(raw.shape) < 1:
-        raise ValueError(f'Unexpected DA3 output shape: {raw.shape}')
-    ph, pw = raw.shape
-    fx = float(p2[0, 0]) * pw / w
-    fy = float(p2[1, 1]) * ph / h
-    focal = (fx + fy) / 2.0
-    depth = torch.from_numpy(raw.copy())[None, None]
-    depth = F.interpolate(depth, size=(h, w), mode='bilinear', align_corners=False)[0, 0].numpy()
-    depth = depth * (focal / 300.0)
-    return depth, {'model_input_hw': [ph, pw], 'fx_original': float(p2[0, 0]),
-                   'fy_original': float(p2[1, 1]), 'fx_processed': fx,
-                   'fy_processed': fy, 'focal_processed': focal, 'focal_scale': focal / 300.0}
+    data = {'path': image_path, 'height': h, 'width': w}
+    if cfg['version'] == 'v2':
+        sample = {'image': rgb / 255.0}
+        for transform in v2_transforms:
+            sample = transform(sample)
+        tensor = torch.from_numpy(sample['image'])
+    else:
+        p2, digest = read_p2(Path(cfg['calib_dir']).expanduser() / (image_path.stem + '.txt'))
+        # Call DA3's official preprocessor for each image individually. Its public
+        # multi-image API center-crops differing sizes, which is not suitable here.
+        tensor_batch, _, _ = model.input_processor(
+            [rgb], process_res=cfg['input_size'], process_res_method='upper_bound_resize',
+            num_workers=1, print_progress=False, sequential=True,
+        )
+        if tensor_batch.ndim != 4 or tensor_batch.shape[0] != 1:
+            raise ValueError(f'Unexpected DA3 preprocessed shape: {tuple(tensor_batch.shape)}')
+        tensor = tensor_batch[0]
+        data['p2'] = p2
+        data['calib_sha256'] = digest
+    data['tensor'] = tensor
+    return data
+
+
+def install_independent_v3_sky(model):
+    """Apply official DA3 sky postprocessing separately to each batch item.
+
+    The official model computes a sky depth quantile over its entire input batch.
+    Running it separately ensures one image's sky value cannot depend on another.
+    """
+    import torch
+    from addict import Dict
+    net = model.model
+    official = net._process_mono_sky_estimation
+
+    def per_image(output):
+        if 'sky' not in output or output['depth'].shape[0] <= 1:
+            return official(output)
+        batch = output['depth'].shape[0]
+        if output['sky'].shape[0] != batch:
+            raise ValueError('Unexpected DA3 sky/depth batch dimensions.')
+        processed = []
+        for i in range(batch):
+            single = Dict(depth=output['depth'][i:i+1], sky=output['sky'][i:i+1])
+            processed.append(official(single).depth)
+        output.depth = torch.cat(processed, dim=0)
+        return output
+
+    net._process_mono_sky_estimation = per_image
+
+
+def predict_batch(model, dev, cfg, records):
+    """True independent-image batch. All records have the same processed shape."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    inputs = torch.stack([r['tensor'] for r in records]).to(dev)
+    ph, pw = inputs.shape[-2:]
+    with torch.inference_mode():
+        if cfg['version'] == 'v2':
+            depth_batch = model(inputs)
+        else:
+            # First axis is batch B, second is views N=1. Do not pass a list of
+            # unrelated frames to inference(): it treats them as multiple views.
+            output = model.forward(inputs[:, None].float())
+            depth_batch = output['depth']
+            if depth_batch.ndim != 4 or depth_batch.shape[1] != 1:
+                raise ValueError(f'Unexpected DA3 depth shape: {tuple(depth_batch.shape)}')
+            depth_batch = depth_batch[:, 0]
+        if depth_batch.ndim != 3 or depth_batch.shape[0] != len(records):
+            raise ValueError(f'Unexpected depth batch shape: {tuple(depth_batch.shape)}')
+        if tuple(depth_batch.shape[-2:]) != (ph, pw):
+            raise ValueError(f'Unexpected depth spatial size: {tuple(depth_batch.shape[-2:])}, expected {(ph, pw)}')
+        # Match previous code: V3 interpolates on CPU; V2 on model device.
+        if cfg['version'] == 'v3':
+            depth_batch = depth_batch.float().cpu()
+        results = []
+        for i, rec in enumerate(records):
+            h, w = rec['height'], rec['width']
+            depth = F.interpolate(depth_batch[i:i+1, None], size=(h, w), mode='bilinear',
+                                  align_corners=(cfg['version'] == 'v2'))[0, 0].float().cpu().numpy()
+            if cfg['version'] == 'v2':
+                extra = {'model_input_hw': [ph, pw], 'max_depth_m': 80.0}
+            else:
+                p2 = rec['p2']
+                fx = float(p2[0, 0]) * pw / w
+                fy = float(p2[1, 1]) * ph / h
+                focal = (fx + fy) / 2.0
+                depth = depth * (focal / 300.0)
+                extra = {'model_input_hw': [ph, pw], 'fx_original': float(p2[0, 0]),
+                         'fy_original': float(p2[1, 1]), 'fx_processed': fx,
+                         'fy_processed': fy, 'focal_processed': focal,
+                         'focal_scale': focal / 300.0, 'calib_sha256': rec['calib_sha256']}
+            results.append((np.asarray(depth, dtype=np.float32), extra))
+    return results
 
 
 def save_atomic(path, depth, metadata):
@@ -261,7 +336,7 @@ def main():
     cfg = read_config(args)
     files = image_paths(cfg, args)
     check_output_manifest(cfg)
-    print(f"Model: {cfg['version']} | input-size: {cfg['input_size']} | images: {len(files)}", flush=True)
+    print(f"Model: {cfg['version']} | input-size: {cfg['input_size']} | batch-size: {cfg['batch_size']} | images: {len(files)}", flush=True)
     print(f"Image dir: {cfg['image_dir']}\nOutput dir: {cfg['output_dir']}", flush=True)
     if cfg['version'] == 'v2':
         print(f"V2 metric VKITTI: {cfg['v2_model']} | resize shorter side", flush=True)
@@ -270,51 +345,92 @@ def main():
     if args.dry_run:
         print(f'Dry run: no model loaded; first: {files[0].name}, last: {files[-1].name}')
         return 0
-    import cv2
+    # DA3's internal info messages would otherwise break the progress line.
+    os.environ.setdefault('DA3_LOG_LEVEL', 'ERROR')
     import numpy as np
     import torch
     model, dev = load_model(cfg)
+    if cfg['version'] == 'v3':
+        install_independent_v3_sky(model)
+        v2_transforms = None
+    else:
+        v2_transforms = make_v2_transforms(cfg['input_size'])
     check_output_manifest(cfg, create=True)
     print(f'Device: {dev}', flush=True)
+
     failures = []
-    for i, image_path in enumerate(files, 1):
-        try:
-            bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-            if bgr is None:
-                raise ValueError(f'Could not read image: {image_path}')
-            h, w = bgr.shape[:2]
-            extra = {}
-            if cfg['version'] == 'v2':
-                depth, extra = predict_v2(model, dev, bgr, cfg['input_size'])
-            else:
-                calib = Path(cfg['calib_dir']).expanduser() / (image_path.stem + '.txt')
-                p2, digest = read_p2(calib)
-                depth, extra = predict_v3(model, bgr, p2, cfg['input_size'])
-                extra['calib_sha256'] = digest
-            depth = np.asarray(depth, dtype=np.float32)
-            if depth.shape != (h, w) or not np.isfinite(depth).all() or (depth < 0).any():
-                raise ValueError(f'Invalid depth output: shape={depth.shape}, expected={(h,w)}, finite={np.isfinite(depth).all()}')
-            meta = {'schema': 1, 'image_id': image_path.stem, 'image_name': image_path.name,
-                    'image_hw': [h, w], 'version': cfg['version'], 'input_size': cfg['input_size'],
-                    'v2_model': cfg['v2_model'] if cfg['version'] == 'v2' else None,
-                    'model_id': 'DA3METRIC-LARGE' if cfg['version'] == 'v3' else f"Depth-Anything-V2-Metric-VKITTI-{cfg['v2_model']}",
-                    'units': 'meters', 'device': dev, 'resize_method': 'lower_bound' if cfg['version'] == 'v2' else 'upper_bound_resize',
-                    'torch_version': torch.__version__, **extra}
-            output = Path(cfg['output_dir']).expanduser() / (image_path.stem + '.npz')
-            save_atomic(output, depth, meta)
-            print(f'[{i}/{len(files)}] {image_path.name} -> {output.name} | input {extra["model_input_hw"]} | output {h}x{w}', flush=True)
-        except Exception as exc:
-            failures.append((image_path.name, str(exc)))
-            print(f'ERROR [{i}/{len(files)}] {image_path.name}: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-            if 'out of memory' in str(exc).lower():
-                print('GPU memory exhausted. Reduce --input-size or try a smaller V2 model.', file=sys.stderr)
-                break
-    print(f'Finished. Saved: {i - len(failures)}/{len(files)}. Errors: {len(failures)}.', flush=True)
-    if failures:
-        for name, message in failures:
-            print(f'  {name}: {message}', file=sys.stderr)
-        return 1
-    return 0
+    saved = 0
+    handled = 0
+    started = time.monotonic()
+    stopped = False
+    line_visible = False
+
+    def progress():
+        nonlocal line_visible
+        elapsed = time.monotonic() - started
+        text = f'Progress: {handled}/{len(files)} | saved: {saved} | errors: {len(failures)} | elapsed: {elapsed:.0f}s'
+        # Carriage return updates the same output line in Colab / terminals.
+        print('\r' + text + ' ' * 15, end='', flush=True)
+        line_visible = True
+
+    def error(path, exc):
+        nonlocal handled, line_visible
+        if line_visible:
+            print('', flush=True)
+            line_visible = False
+        failures.append((path.name, f'{type(exc).__name__}: {exc}'))
+        handled += 1
+        print(f'ERROR {path.name}: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+
+    for start in range(0, len(files), cfg['batch_size']):
+        records = []
+        for path in files[start:start + cfg['batch_size']]:
+            try:
+                records.append(prepare_one(path, cfg, model, v2_transforms))
+            except Exception as exc:
+                error(path, exc)
+        # Different original sizes can give different model tensor sizes. Group
+        # only equal tensors; never stretch/crop one image to match another.
+        groups = {}
+        for rec in records:
+            groups.setdefault(tuple(rec['tensor'].shape), []).append(rec)
+        for group in groups.values():
+            try:
+                outputs = predict_batch(model, dev, cfg, group)
+            except Exception as exc:
+                for rec in group:
+                    error(rec['path'], exc)
+                if 'out of memory' in str(exc).lower():
+                    print('GPU memory exhausted. Reduce batch_size to 1 or lower input_size.', file=sys.stderr, flush=True)
+                    stopped = True
+                    break
+                continue
+            for rec, (depth, extra) in zip(group, outputs):
+                try:
+                    path = rec['path']
+                    h, w = rec['height'], rec['width']
+                    if depth.shape != (h, w) or not np.isfinite(depth).all() or (depth < 0).any():
+                        raise ValueError(f'Invalid depth output: shape={depth.shape}, expected={(h,w)}, finite={np.isfinite(depth).all()}')
+                    meta = {'schema': 1, 'image_id': path.stem, 'image_name': path.name,
+                            'image_hw': [h, w], 'version': cfg['version'], 'input_size': cfg['input_size'],
+                            'v2_model': cfg['v2_model'] if cfg['version'] == 'v2' else None,
+                            'model_id': 'DA3METRIC-LARGE' if cfg['version'] == 'v3' else f"Depth-Anything-V2-Metric-VKITTI-{cfg['v2_model']}",
+                            'units': 'meters', 'device': dev, 'resize_method': 'lower_bound' if cfg['version'] == 'v2' else 'upper_bound_resize',
+                            'torch_version': torch.__version__, 'batch_size_requested': cfg['batch_size'],
+                            'batch_size_used': len(group), **extra}
+                    target = Path(cfg['output_dir']).expanduser() / (path.stem + '.npz')
+                    save_atomic(target, depth, meta)
+                    saved += 1
+                    handled += 1
+                except Exception as exc:
+                    error(rec['path'], exc)
+        progress()
+        if stopped:
+            break
+    if line_visible:
+        print('', flush=True)
+    print(f'Finished. Saved: {saved}/{len(files)}. Errors: {len(failures)}. Unprocessed: {len(files) - handled}.', flush=True)
+    return 1 if failures or handled != len(files) else 0
 
 
 if __name__ == '__main__':
