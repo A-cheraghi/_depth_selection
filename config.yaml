@@ -21,7 +21,7 @@ depth:
   # This section is used only when version: v2
   v2:
     # Model size: small, base, or large
-    model: small
+    model: large
     # V2 input image size; default is 518 for all three models
     input_size: 518
     # Repository and pretrained weights directories downloaded during setup
