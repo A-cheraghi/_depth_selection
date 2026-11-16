@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 
@@ -283,7 +284,9 @@ def predict_batch(model, dev, cfg, records):
         else:
             # First axis is batch B, second is views N=1. Do not pass a list of
             # unrelated frames to inference(): it treats them as multiple views.
-            output = model.forward(inputs[:, None].float())
+            # The official inference() passes an empty list. The forward()
+            # default is None, which the backbone cannot iterate over.
+            output = model.forward(inputs[:, None].float(), export_feat_layers=[])
             depth_batch = output['depth']
             if depth_batch.ndim != 4 or depth_batch.shape[1] != 1:
                 raise ValueError(f'Unexpected DA3 depth shape: {tuple(depth_batch.shape)}')
@@ -378,9 +381,12 @@ def main():
         if line_visible:
             print('', flush=True)
             line_visible = False
+        first_error = not failures
         failures.append((path.name, f'{type(exc).__name__}: {exc}'))
         handled += 1
         print(f'ERROR {path.name}: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+        if first_error:
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
     for start in range(0, len(files), cfg['batch_size']):
         records = []
@@ -389,6 +395,10 @@ def main():
                 records.append(prepare_one(path, cfg, model, v2_transforms))
             except Exception as exc:
                 error(path, exc)
+        if not records:
+            print('No image in this batch could be prepared; stopping to avoid repeated errors.', file=sys.stderr, flush=True)
+            progress()
+            break
         # Different original sizes can give different model tensor sizes. Group
         # only equal tensors; never stretch/crop one image to match another.
         groups = {}
@@ -402,9 +412,10 @@ def main():
                     error(rec['path'], exc)
                 if 'out of memory' in str(exc).lower():
                     print('GPU memory exhausted. Reduce batch_size to 1 or lower input_size.', file=sys.stderr, flush=True)
-                    stopped = True
-                    break
-                continue
+                else:
+                    print('Model inference failed; stopping to avoid repeating the same error.', file=sys.stderr, flush=True)
+                stopped = True
+                break
             for rec, (depth, extra) in zip(group, outputs):
                 try:
                     path = rec['path']
