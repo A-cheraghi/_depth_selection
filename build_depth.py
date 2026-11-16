@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build metric depth maps from KITTI image_2, one NPZ per image.
 
 V2 uses the official metric-depth repo and VKITTI weights. V3 uses the DA3
