@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
 """Build metric depth maps from KITTI image_2, one NPZ per image.
 
 V2 uses the official metric-depth repo and VKITTI weights. V3 uses the DA3
-API and camera focal correction. CLI arguments override the YAML depth section.
+API and camera focal correction. All models must already exist locally.
+CLI arguments override the YAML depth section.
 """
 from __future__ import annotations
 
@@ -25,8 +27,8 @@ def arguments():
     p.add_argument('--input-size', type=int, help='V2: short side; V3: long side, in pixels')
     p.add_argument('--v2-model', choices=['small', 'base', 'large'])
     p.add_argument('--v2-repo', help='Root of official Depth-Anything-V2 git repository')
-    p.add_argument('--v2-checkpoint', help='Optional local official VKITTI .pth checkpoint')
-    p.add_argument('--v3-model-id', help='DA3METRIC-LARGE Hub ID or local model directory')
+    p.add_argument('--v2-weights-dir', help='Directory with official V2 metric VKITTI weights')
+    p.add_argument('--v3-model-dir', help='Local DA3METRIC-LARGE model directory')
     p.add_argument('--device', choices=['auto', 'cuda', 'cpu'])
     p.add_argument('--image-id', help='Process one image stem, e.g. 000004')
     p.add_argument('--limit', type=int, help='Process at most this many sorted images')
@@ -57,10 +59,10 @@ def read_config(args):
     out = args.output_dir if args.output_dir is not None else d.get('output_dir')
     if not out:
         raise ValueError('Specify --output-dir or set depth.output_dir in YAML.')
-    model_id = args.v3_model_id or v3.get('model_id', 'depth-anything/DA3METRIC-LARGE')
-    # Formula below applies to the single-branch DA3 metric model, not relative/nested models.
-    if version == 'v3' and Path(str(model_id)).name != 'DA3METRIC-LARGE':
-        raise ValueError('V3 must be DA3METRIC-LARGE, or a local directory named DA3METRIC-LARGE; other checkpoints are not supported.')
+    model_dir = args.v3_model_dir or v3.get('model_dir', '/content/depth_models/DA3METRIC-LARGE')
+    # The focal correction below is only for the single-branch DA3 metric model.
+    if version == 'v3' and Path(str(model_dir)).name != 'DA3METRIC-LARGE':
+        raise ValueError('V3 model directory must be named DA3METRIC-LARGE.')
     size = args.input_size if args.input_size is not None else (v2.get('input_size', 518) if version == 'v2' else v3.get('input_size', 504))
     if isinstance(size, bool) or not isinstance(size, int) or size < 14:
         raise ValueError('input_size must be an integer >= 14.')
@@ -75,8 +77,8 @@ def read_config(args):
     return dict(version=version, image_dir=args.image_dir or d.get('image_dir'),
                 calib_dir=args.calib_dir or d.get('calib_dir'), output_dir=out,
                 input_size=size, device=device, v2_model=model,
-                v2_repo=args.v2_repo or v2.get('repo_dir'),
-                v2_checkpoint=args.v2_checkpoint or v2.get('checkpoint'), v3_model_id=model_id)
+                v2_repo=args.v2_repo or v2.get('repo_dir', '/content/Depth-Anything-V2'),
+                v2_weights_dir=args.v2_weights_dir or v2.get('weights_dir', '/content/depth_models/v2'), v3_model_dir=model_dir)
 
 
 def image_paths(cfg, args):
@@ -117,8 +119,8 @@ def check_output_manifest(cfg, create=False):
     path = out / 'depth_run.json'
     identity = {'schema': 1, 'version': cfg['version'], 'input_size': cfg['input_size'],
                 'resize_method': 'lower_bound' if cfg['version'] == 'v2' else 'upper_bound_resize',
-                'model': cfg['v2_model'] if cfg['version'] == 'v2' else cfg['v3_model_id'],
-                'v2_checkpoint': str(Path(cfg['v2_checkpoint']).expanduser().resolve()) if cfg['version'] == 'v2' and cfg['v2_checkpoint'] else None,
+                'model': cfg['v2_model'] if cfg['version'] == 'v2' else 'DA3METRIC-LARGE',
+                'model_dir': str(Path(cfg['v2_weights_dir'] if cfg['version'] == 'v2' else cfg['v3_model_dir']).expanduser().resolve()),
                 'image_dir': str(Path(cfg['image_dir']).expanduser().resolve()),
                 'calib_dir': str(Path(cfg['calib_dir']).expanduser().resolve()) if cfg['version'] == 'v3' else None}
     if path.is_file():
@@ -163,7 +165,11 @@ def load_model(cfg):
         raise RuntimeError('CUDA was requested but torch.cuda.is_available() is false.')
     if cfg['version'] == 'v3':
         from depth_anything_3.api import DepthAnything3
-        model = DepthAnything3.from_pretrained(cfg['v3_model_id']).to(dev).eval()
+        model_dir = Path(cfg['v3_model_dir']).expanduser()
+        for filename in ('config.json', 'model.safetensors'):
+            if not (model_dir / filename).is_file():
+                raise FileNotFoundError(f'V3 model file not found: {model_dir / filename}. Run the installation cell first.')
+        model = DepthAnything3.from_pretrained(str(model_dir.resolve()), local_files_only=True).to(dev).eval()
         return model, dev
 
     repo = Path(cfg['v2_repo'] or '').expanduser()
@@ -178,15 +184,11 @@ def load_model(cfg):
         'large': ('vitl', 256, [256, 512, 1024, 1024], 'Large'),
     }
     enc, features, channels, label = variants[cfg['v2_model']]
-    checkpoint = cfg['v2_checkpoint']
-    if checkpoint:
-        if not Path(checkpoint).expanduser().is_file():
-            raise FileNotFoundError(f'V2 checkpoint not found: {checkpoint}')
-        checkpoint = str(Path(checkpoint).expanduser())
-    else:
-        from huggingface_hub import hf_hub_download
-        checkpoint = hf_hub_download(repo_id=f'depth-anything/Depth-Anything-V2-Metric-VKITTI-{label}',
-                                     filename=f'depth_anything_v2_metric_vkitti_{enc}.pth')
+    if not cfg['v2_weights_dir']:
+        raise ValueError('Set v2.weights_dir in config.yaml or use --v2-weights-dir.')
+    checkpoint = Path(cfg['v2_weights_dir']).expanduser() / f'depth_anything_v2_metric_vkitti_{enc}.pth'
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f'V2 weight file not found: {checkpoint}. Run the installation cell first.')
     model = DepthAnythingV2(encoder=enc, features=features, out_channels=channels, max_depth=80)
     model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True), strict=True)
     return model.to(dev).eval(), dev
@@ -264,7 +266,7 @@ def main():
     if cfg['version'] == 'v2':
         print(f"V2 metric VKITTI: {cfg['v2_model']} | resize shorter side", flush=True)
     else:
-        print(f"V3: {cfg['v3_model_id']} | resize longer side | calib: {cfg['calib_dir']}", flush=True)
+        print(f"V3: {cfg['v3_model_dir']} | resize longer side | calib: {cfg['calib_dir']}", flush=True)
     if args.dry_run:
         print(f'Dry run: no model loaded; first: {files[0].name}, last: {files[-1].name}')
         return 0
@@ -295,7 +297,7 @@ def main():
             meta = {'schema': 1, 'image_id': image_path.stem, 'image_name': image_path.name,
                     'image_hw': [h, w], 'version': cfg['version'], 'input_size': cfg['input_size'],
                     'v2_model': cfg['v2_model'] if cfg['version'] == 'v2' else None,
-                    'model_id': cfg['v3_model_id'] if cfg['version'] == 'v3' else f"Depth-Anything-V2-Metric-VKITTI-{cfg['v2_model']}",
+                    'model_id': 'DA3METRIC-LARGE' if cfg['version'] == 'v3' else f"Depth-Anything-V2-Metric-VKITTI-{cfg['v2_model']}",
                     'units': 'meters', 'device': dev, 'resize_method': 'lower_bound' if cfg['version'] == 'v2' else 'upper_bound_resize',
                     'torch_version': torch.__version__, **extra}
             output = Path(cfg['output_dir']).expanduser() / (image_path.stem + '.npz')

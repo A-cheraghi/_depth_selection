@@ -1,0 +1,32 @@
+# Project configuration: Each module has its own settings in a separate section.
+
+depth:
+  # Model version to use: v2 or v3
+  version: v3
+
+  # Input image directory and output directory for depth maps
+  image_dir: /content/Geo/data/kitti/training/image_2
+  output_dir: /content/Geo/depth_maps/v3_504
+
+  # KITTI calibration directory; required only for V3
+  calib_dir: /content/Geo/data/kitti/training/calib
+
+  # auto: automatically use the GPU if available
+  device: auto
+
+  # This section is used only when version: v2
+  v2:
+    # Model size: small, base, or large
+    model: small
+    # V2 input image size; default is 518 for all three models
+    input_size: 518
+    # Repository and pretrained weights directories downloaded during setup
+    repo_dir: /content/Depth-Anything-V2
+    weights_dir: /content/depth_models/v2
+
+  # This section is used only when version: v3
+  v3:
+    # V3 input image size
+    input_size: 504
+    # Directory containing the pretrained V3 metric depth model
+    model_dir: /content/depth_models/DA3METRIC-LARGE
