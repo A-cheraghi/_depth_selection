@@ -16,7 +16,7 @@ depth:
 
   # Number of independent images per GPU forward pass.
   # Start with 2 on T4. If GPU memory runs out, use 1.
-  batch_size: 6
+  batch_size: 4
 
   # This section is used only when version: v2
   v2:
